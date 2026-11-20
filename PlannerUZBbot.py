@@ -3,6 +3,7 @@ import os
 import threading
 import sqlite3
 import datetime
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,6 +19,7 @@ from telegram.ext import (
 
 # ---------- CONFIG & WEB SERVER ----------
 TOKEN = os.environ.get("BOT_TOKEN")
+TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
@@ -33,20 +35,25 @@ def run_dummy_server():
     server.serve_forever()
 
 # ---------- DATABASE SETUP ----------
-# This creates a file called tasks.db next to your bot.py
 conn = sqlite3.connect('tasks.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Create the table if it doesn't exist
+# Create table (Added last_reminded to track nagging)
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         task_name TEXT,
         task_time TEXT,
-        last_completed DATE
+        last_completed DATE,
+        last_reminded DATETIME
     )
 ''')
+# In case you already have a database, this adds the new column safely
+try:
+    cursor.execute("ALTER TABLE tasks ADD COLUMN last_reminded DATETIME")
+except sqlite3.OperationalError:
+    pass # Column already exists
 conn.commit()
 
 # ---------- CONVERSATION STATES ----------
@@ -57,12 +64,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I am your Planner Bot. 📅\n\n"
         "Commands:\n"
-        "/add - Add a new daily task (e.g., Drink medicine at 08:00)\n"
+        "/add - Add a new daily task\n"
         "/list - See your tasks and mark them done\n"
         "/delete - Delete a task\n"
     )
 
-# --- ADD TASK CONVERSATION ---
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("What is the task? (e.g., Drink medicine, Go to gym)\n\nSend /cancel to stop.")
     return ASK_TASK_NAME
@@ -75,7 +81,6 @@ async def add_task_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_task_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = update.message.text
     try:
-        # Check if the user typed a valid time
         datetime.datetime.strptime(time_str, "%H:%M")
     except ValueError:
         await update.message.reply_text("Invalid format. Please use HH:MM (like 08:00 or 20:30).")
@@ -83,13 +88,13 @@ async def add_task_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task_name = context.user_data['task_name']
     user_id = update.effective_user.id
+    today = str(datetime.datetime.now(TASHKENT_TZ).date())
 
-    # Save to database
-    cursor.execute("INSERT INTO tasks (user_id, task_name, task_time, last_completed) VALUES (?, ?, ?, ?)",
-                   (user_id, task_name, time_str, "2000-01-01"))
+    cursor.execute("INSERT INTO tasks (user_id, task_name, task_time, last_completed, last_reminded) VALUES (?, ?, ?, ?, ?)",
+                   (user_id, task_name, time_str, "2000-01-01", None))
     conn.commit()
 
-    await update.message.reply_text(f"✅ Saved! I will remind you to '{task_name}' every day at {time_str}.")
+    await update.message.reply_text(f"✅ Saved! I will remind you to '{task_name}' every day at {time_str} until you mark it as Done.")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,7 +111,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You have no tasks. Use /add to create one.")
         return
 
-    today = str(datetime.date.today())
+    today = str(datetime.datetime.now(TASHKENT_TZ).date())
     keyboard = []
     
     message = "📋 **Your Daily Tasks:**\n\n"
@@ -127,12 +132,13 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     task_id = query.data.split("_")[1]
-    today = str(datetime.date.today())
+    today = str(datetime.datetime.now(TASHKENT_TZ).date())
     
-    cursor.execute("UPDATE tasks SET last_completed = ? WHERE id = ?", (today, task_id))
+    # Save as done, and reset last_reminded so it works again tomorrow
+    cursor.execute("UPDATE tasks SET last_completed = ?, last_reminded = NULL WHERE id = ?", (today, task_id))
     conn.commit()
     
-    await query.edit_message_text("🎉 Great job! Task marked as completed for today.")
+    await query.edit_message_text("🎉 Great job! Task marked as completed. I will stop reminding you until tomorrow.")
 
 # --- DELETE TASK ---
 async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,30 +163,49 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     await query.edit_message_text("🗑️ Task deleted.")
 
-# ---------- THE SCHEDULER (REMINDERS) ----------
+# ---------- THE SCHEDULER (NAGGING REMINDERS) ----------
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    # This function runs every minute in the background
-    now = datetime.datetime.now()
-    current_time = now.strftime("%H:%M")
+    now = datetime.datetime.now(TASHKENT_TZ)
     today = str(now.date())
+    current_time = now.strftime("%H:%M")
 
-    # Find tasks that match the current time and haven't been done today
-    cursor.execute("SELECT id, user_id, task_name FROM tasks WHERE task_time = ? AND last_completed != ?", (current_time, today))
+    # Get all tasks that haven't been completed today
+    cursor.execute("SELECT id, user_id, task_name, task_time, last_reminded FROM tasks WHERE last_completed != ?", (today,))
     due_tasks = cursor.fetchall()
 
     for task in due_tasks:
-        task_id, user_id, task_name = task
-        try:
-            keyboard = [[InlineKeyboardButton("✅ Mark as Done", callback_data=f"done_{task_id}")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=user_id, 
-                text=f"🔔 **Reminder:** It's time for: **{task_name}**!",
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            print(f"Failed to send reminder: {e}")
+        task_id, user_id, task_name, task_time, last_reminded_str = task
+        
+        # If the current time is past the task time (e.g., it's 09:00 and task was 08:00)
+        if current_time >= task_time:
+            should_remind = False
+            
+            if not last_reminded_str:
+                # Never reminded today
+                should_remind = True
+            else:
+                # Check when we last reminded them
+                last_reminded = datetime.datetime.strptime(last_reminded_str, "%Y-%m-%d %H:%M:%S")
+                # If it's been more than 60 minutes (3600 seconds), remind them again
+                if (now - last_reminded).total_seconds() >= 3600:
+                    should_remind = True
+                    
+            if should_remind:
+                try:
+                    keyboard = [[InlineKeyboardButton("✅ Mark as Done", callback_data=f"done_{task_id}")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await context.bot.send_message(
+                        chat_id=user_id, 
+                        text=f"🔔 **Reminder:** Have you done: **{task_name}**? (Scheduled for {task_time})",
+                        reply_markup=reply_markup,
+                        parse_mode="Markdown"
+                    )
+                    # Save the time of this reminder
+                    cursor.execute("UPDATE tasks SET last_reminded = ? WHERE id = ?", (now.strftime("%Y-%m-%d %H:%M:%S"), task_id))
+                    conn.commit()
+                except Exception as e:
+                    print(f"Failed to send reminder: {e}")
 
 # ---------- MAIN ----------
 def main():
@@ -188,7 +213,6 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Add Task Conversation
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("add", add_task_start)],
         states={
@@ -205,11 +229,11 @@ def main():
     app.add_handler(CallbackQueryHandler(mark_done, pattern="^done_"))
     app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^del_"))
 
-    # Setup the scheduler to run every 60 seconds
+    # Check for reminders every 60 seconds
     job_queue = app.job_queue
     job_queue.run_repeating(check_reminders, interval=60, first=10)
 
-    print("✅ Bot is running with Database & Scheduler.")
+    print("✅ Bot is running with Tashkent Time, Database & Nagging Reminders.")
     app.run_polling()
 
 if __name__ == "__main__":
